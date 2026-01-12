@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 from loguru import logger
-
 from nymeria.definitions import Subpaths, VrsFiles
 from projectaria_tools.core import data_provider, mps
 from projectaria_tools.core.data_provider import VrsDataProvider

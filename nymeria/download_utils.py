@@ -68,9 +68,9 @@ class DlLink:
         return "logs"
 
     def __check_outdir(self, outdir: Path) -> None:
-        assert (
-            outdir.name == self.seq_name
-        ), f"Output directory name ({outdir.name}) mismatch with sequence {self.seq_name}"
+        assert outdir.name == self.seq_name, (
+            f"Output directory name ({outdir.name}) mismatch with sequence {self.seq_name}"
+        )
         outdir.mkdir(exist_ok=True)
 
     def get(self, outdir: Path, ignore_existing: bool = True) -> None:
@@ -170,9 +170,9 @@ class DownloadManager:
         with open(self.url_json, "r") as f:
             data = json.load(f)
             self._sequences = data.get("sequences", {})
-            assert len(
-                self._sequences
-            ), "No sequence found. Please check the json file is correct."
+            assert len(self._sequences), (
+                "No sequence found. Please check the json file is correct."
+            )
         self.__get_data_summary()
         self._logs = {}
 

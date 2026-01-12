@@ -185,7 +185,7 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
             tdiff: int = None
             pose, tdiff = rec.get_pose(t_ns_global, time_domain=TimeDomain.TIME_CODE)
             if abs(tdiff / 1e6) > 2:  # 2ms
-                logger.warning(f"time difference for pose query {tdiff/1e6} ms")
+                logger.warning(f"time difference for pose query {tdiff / 1e6} ms")
 
             data[rec.tag] = pose
             if rec.tag == "recording_head":
