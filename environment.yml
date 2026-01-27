@@ -9,6 +9,8 @@ dependencies:
   - click
   - requests
   - pymomentum>=0.1.33
+  - ezc3d<1.6.0
+  - rerun-sdk<0.28.0
   - tqdm
   - pip
   - pip:
