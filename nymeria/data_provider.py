@@ -15,10 +15,20 @@ from nymeria.path_provider import SequencePathProvider
 from nymeria.recording_data_provider import (
     create_recording_data_provider,
     RecordingDataProvider,
+    OnlineCalibLookupStrategy,
 )
 from projectaria_tools.core.mps import ClosedLoopTrajectoryPose
 from projectaria_tools.core.sensor_data import TimeDomain
 from projectaria_tools.core.sophus import SE3
+
+
+# Mapping from short device aliases to full recording tags
+_DEVICE_TAG_ALIASES: dict[str, str] = {
+    "head": "recording_head",
+    "observer": "recording_observer",
+    "lwrist": "recording_lwrist",
+    "rwrist": "recording_rwrist",
+}
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,10 @@ class NymeriaDataProviderConfig:
     handeye_skip: int = 240 * 5
     handeye_stride: int = 2
 
+    # Online calibration options
+    load_online_calib: bool = False
+    online_calib_lookup_strategy: OnlineCalibLookupStrategy = "nearest"
+
 
 class NymeriaDataProvider(NymeriaDataProviderConfig):
     def __init__(self, **kwargs) -> None:
@@ -53,22 +67,38 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
 
         # create data provider for Aria recordings and MPS output
         self.recording_head = (
-            create_recording_data_provider(seq_pd.recording_head)
+            create_recording_data_provider(
+                seq_pd.recording_head,
+                load_online_calib=self.load_online_calib,
+                online_calib_lookup_strategy=self.online_calib_lookup_strategy,
+            )
             if self.load_head
             else None
         )
         self.recording_lwrist = (
-            create_recording_data_provider(seq_pd.recording_lwrist)
+            create_recording_data_provider(
+                seq_pd.recording_lwrist,
+                load_online_calib=self.load_online_calib,
+                online_calib_lookup_strategy=self.online_calib_lookup_strategy,
+            )
             if self.load_wrist
             else None
         )
         self.recording_rwrist = (
-            create_recording_data_provider(seq_pd.recording_rwrist)
+            create_recording_data_provider(
+                seq_pd.recording_rwrist,
+                load_online_calib=self.load_online_calib,
+                online_calib_lookup_strategy=self.online_calib_lookup_strategy,
+            )
             if self.load_wrist
             else None
         )
         self.recording_observer = (
-            create_recording_data_provider(seq_pd.recording_observer)
+            create_recording_data_provider(
+                seq_pd.recording_observer,
+                load_online_calib=self.load_online_calib,
+                online_calib_lookup_strategy=self.online_calib_lookup_strategy,
+            )
             if self.load_observer
             else None
         )
@@ -95,6 +125,8 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
         # compute xsens to aria world alignment
         self.__compute_xsens_to_aria_alignment()
 
+    # ---- Recording access ----
+
     def get_existing_recordings(self) -> list[RecordingDataProvider]:
         return [
             x
@@ -106,6 +138,49 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
             ]
             if x is not None
         ]
+
+    def get_recording(self, device_tag: str) -> RecordingDataProvider:
+        """
+        Resolve a device tag to its RecordingDataProvider.
+
+        Accepts both full tags ("recording_head") and short aliases ("head").
+
+        Args:
+            device_tag: Device identifier, e.g. "recording_head", "head",
+                "recording_lwrist", "lwrist", etc.
+
+        Returns:
+            RecordingDataProvider for the requested device
+
+        Raises:
+            ValueError: If the device tag is unknown or the recording is not loaded
+        """
+        # Normalize: resolve alias to full tag
+        canonical = _DEVICE_TAG_ALIASES.get(device_tag, device_tag)
+
+        mapping = {
+            "recording_head": self.recording_head,
+            "recording_observer": self.recording_observer,
+            "recording_lwrist": self.recording_lwrist,
+            "recording_rwrist": self.recording_rwrist,
+        }
+
+        if canonical not in mapping:
+            valid = list(mapping.keys()) + list(_DEVICE_TAG_ALIASES.keys())
+            raise ValueError(
+                f"Unknown device tag '{device_tag}'. "
+                f"Valid tags: {valid}"
+            )
+
+        rec = mapping[canonical]
+        if rec is None:
+            raise ValueError(
+                f"Recording '{canonical}' is not loaded. "
+                f"Check load_head/load_wrist/load_observer config."
+            )
+        return rec
+
+    # ---- Time span ----
 
     def __get_timespan_ns(self, ignore_ns: int = 1e9) -> tuple[int, int]:
         """
@@ -132,6 +207,87 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
         duration = (t_end - t_start) / 1.0e9
         logger.info(f"time span: {t_start= }us {t_end= }us {duration= }s")
         return t_start, t_end
+
+    # ---- Sensor pose and calibration (high-level primitives) ----
+
+    def get_sensor_pose(
+        self,
+        t_ns: int,
+        device_tag: str,
+        sensor_label: str,
+        time_domain: TimeDomain = TimeDomain.TIME_CODE,
+    ) -> tuple[SE3, int]:
+        """
+        Get ONE pose at ONE time for ONE sensor on ONE device.
+
+        Computes: T_world_sensor = T_world_device @ T_device_sensor
+
+        Args:
+            t_ns: Timestamp in nanoseconds
+            device_tag: Device identifier ("recording_head", "head", etc.)
+            sensor_label: Sensor label ("imu-left", "camera-rgb", "mag0", etc.)
+            time_domain: Time domain of t_ns
+
+        Returns:
+            Tuple of (T_world_sensor as SE3, t_diff_ns from closest pose)
+
+        Raises:
+            ValueError: If device or sensor is not found
+            RuntimeError: If pose or calibration data is not available
+        """
+        rec = self.get_recording(device_tag)
+
+        if not rec.has_pose:
+            raise RuntimeError(
+                f"Recording '{device_tag}' has no closed loop trajectory"
+            )
+
+        # T_world_device at timestamp
+        pose, t_diff = rec.get_pose(t_ns, time_domain)
+        T_world_device = pose.transform_world_device
+
+        # T_device_sensor (online or factory/CAD)
+        T_device_sensor = rec.get_T_device_sensor(sensor_label, t_ns, time_domain)
+
+        # Compose
+        T_world_sensor = T_world_device @ T_device_sensor
+
+        return T_world_sensor, t_diff
+
+    def get_sensor_calibration(
+        self,
+        device_tag: str,
+        sensor_label: str,
+        t_ns: int | None = None,
+        time_domain: TimeDomain = TimeDomain.TIME_CODE,
+    ):
+        """
+        Get sensor calibration (intrinsics + extrinsics) for a given sensor.
+
+        Returns the full calibration object which provides access to intrinsic
+        parameters (biases, rectification matrices, projection models, etc.)
+        as well as extrinsic transforms.
+
+        Args:
+            device_tag: Device identifier ("recording_head", "head", etc.)
+            sensor_label: Sensor label ("imu-left", "camera-rgb", "mag0", etc.)
+            t_ns: Optional timestamp for online calibration lookup (nanoseconds)
+            time_domain: Time domain of t_ns
+
+        Returns:
+            Sensor-specific calibration object:
+                - ImuCalibration for "imu-left", "imu-right"
+                  (get_accel_model(), get_gyro_model(), get_transform_device_imu())
+                - CameraCalibration for camera sensors
+                  (get_transform_device_camera(), projection model, etc.)
+                - MagnetometerCalibration for "mag0"
+                  (get_model() with get_bias(), get_rectification())
+                - etc.
+        """
+        rec = self.get_recording(device_tag)
+        return rec.get_sensor_calibration(sensor_label, t_ns, time_domain)
+
+    # ---- Existing high-level functions (unchanged) ----
 
     def get_synced_rgb_videos(self, t_ns_global: int) -> dict[str, any]:
         data = {}
@@ -203,6 +359,8 @@ class NymeriaDataProvider(NymeriaDataProviderConfig):
             if skin is not None:
                 data["momentum"] = skin
         return data
+
+    # ---- XSens alignment (unchanged) ----
 
     def __compute_xsens_to_aria_alignment(self) -> None:
         """
