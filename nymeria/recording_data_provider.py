@@ -391,6 +391,42 @@ class RecordingDataProvider(RecordingPathProvider):
             )
         return T_device_sensor
 
+    # ---- Sensor timestamps ----
+
+    def get_sensor_timestamps_device_time_ns(self, sensor_label: str) -> np.ndarray:
+        """
+        Get all native capture timestamps for a sensor stream from VRS.
+
+        Iterates over the raw sensor data in the VRS file and extracts
+        the capture timestamp for each sample, at the sensor's native rate.
+
+        Timestamps are returned in DEVICE_TIME domain. Use
+        vrs_dp.convert_from_device_time_to_timecode_ns() to convert
+        individual timestamps to TIME_CODE if needed for cross-device
+        comparisons.
+
+        Args:
+            sensor_label: Sensor label (e.g. "imu-left", "imu-right")
+
+        Returns:
+            np.ndarray of int64 timestamps in nanoseconds (DEVICE_TIME).
+
+        Raises:
+            RuntimeError: If VRS data provider is not available
+        """
+        if self._vrs_dp is None:
+            raise RuntimeError("VRS data provider required for sensor timestamps")
+
+        stream_id = self._vrs_dp.get_stream_id_from_label(sensor_label)
+        n = self._vrs_dp.get_num_data(stream_id)
+
+        timestamps = np.empty(n, dtype=np.int64)
+        for i in range(n):
+            imu_data = self._vrs_dp.get_imu_data_by_index(stream_id, i)
+            timestamps[i] = imu_data.capture_timestamp_ns
+
+        return timestamps
+
     # ---- Point cloud ----
 
     @property
@@ -446,7 +482,7 @@ class RecordingDataProvider(RecordingPathProvider):
 
     @property
     def has_vrs(self) -> bool:
-        return self.vrs_dp is not None
+        return self._vrs_dp is not None
 
     @property
     def has_rgb(self) -> bool:
