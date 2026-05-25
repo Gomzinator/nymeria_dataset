@@ -101,7 +101,7 @@ def main(url_json: Path, rootdir: Path, minimal: bool, overwrite: bool, match_ke
 
     dl = DownloadManager(url_json, out_rootdir=rootdir)
     groups = get_groups_IMU() if minimal else get_groups()
-    dl.download(match_key=match_key, selected_groups=groups, ignore_existing=overwrite)
+    dl.download(match_key=match_key, selected_groups=groups, ignore_existing=not overwrite)
 
 
 if __name__ == "__main__":
