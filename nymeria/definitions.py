@@ -177,9 +177,6 @@ def get_group_definitions() -> dict[str, list]:
                 f"{x.default}/{SlamFiles.semidense_observations}"
             )
 
-    print("=== group definitions (group_name: [group_files]) ===")
-    print(json.dumps(g_defs, indent=2))
-
     return g_defs
 
 

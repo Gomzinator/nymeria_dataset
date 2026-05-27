@@ -12,47 +12,71 @@ from loguru import logger
 from nymeria.definitions import DataGroups
 from nymeria.download_utils import DownloadManager
 
+# et.vrs (eye-tracking) is always excluded from extraction — it is bundled inside
+# the recording_head / recording_observer zips but stripped out on unzip.
+_EXCLUDE_PATTERNS = ["et.vrs"]
 
-def get_groups(full: bool = False) -> list[DataGroups]:
+
+def get_groups(video: bool = False) -> list[DataGroups]:
     """
-    By default all data present in nymeria_download_urls.json will be downloaded.
-    For selective download, comment out lines to disable certain groups.
-    See nymeria/definitions.py GroupDefs for the files included by each group.
+    Full download: body, all recordings, narrations, raw Xsens.
+
+    Files included per recording_head / recording_observer group (zip):
+      - motion.vrs  — IMU + audio, no video (always downloaded)
+      - et.vrs      — eye tracking (always excluded via _EXCLUDE_PATTERNS)
+      - mps/slam/   — SLAM trajectories & calibration
+      - mps/eye_gaze/ — gaze CSVs
+
+    Pass video=True (--video flag) to also fetch data.vrs, which is the
+    full-sensor VRS with video streams on top of motion data.
+
+    semidense_observations (3D point cloud) is excluded by default.
     """
-    return [
+    groups = [
         DataGroups.LICENSE,
         DataGroups.metadata_json,
         DataGroups.body_motion,
-        DataGroups.recording_head,
-        DataGroups.recording_head_data_data_vrs,
+        DataGroups.recording_head,       # motion.vrs + SLAM + gaze (et.vrs stripped)
         DataGroups.recording_lwrist,
         DataGroups.recording_rwrist,
-        DataGroups.recording_observer,
-        DataGroups.recording_observer_data_data_vrs,
+        DataGroups.recording_observer,   # motion.vrs + SLAM + gaze (et.vrs stripped)
         DataGroups.narration_motion_narration_csv,
         DataGroups.narration_atomic_action_csv,
         DataGroups.narration_activity_summarization_csv,
-        DataGroups.semidense_observations,
+        # DataGroups.semidense_observations,  # 3D point cloud — large, opt-in only
         DataGroups.body_xdata_mvnx,
     ]
+    if video:
+        # data.vrs is the full-sensor recording including all video streams;
+        # it is a superset of motion.vrs (which is stripped of video).
+        groups += [
+            DataGroups.recording_head_data_data_vrs,
+            DataGroups.recording_observer_data_data_vrs,
+        ]
+    return groups
 
-def get_groups_IMU() -> list[DataGroups]:
-    return [
+
+def get_groups_IMU(video: bool = False) -> list[DataGroups]:
+    """
+    Minimal download for VIO post-processing: recordings + body motion only,
+    no narrations.  Same et.vrs / semidense exclusion rules as get_groups().
+    """
+    groups = [
         DataGroups.LICENSE,
         DataGroups.metadata_json,
         DataGroups.body_motion,
         DataGroups.recording_head,
-        # DataGroups.recording_head_data_data_vrs,
         DataGroups.recording_lwrist,
         DataGroups.recording_rwrist,
         DataGroups.recording_observer,
-        # DataGroups.recording_observer_data_data_vrs,
-        # DataGroups.narration_motion_narration_csv,
-        # DataGroups.narration_atomic_action_csv,
-        # DataGroups.narration_activity_summarization_csv,
-        # DataGroups.semidense_observations,
         DataGroups.body_xdata_mvnx,
     ]
+    if video:
+        groups += [
+            DataGroups.recording_head_data_data_vrs,
+            DataGroups.recording_observer_data_data_vrs,
+        ]
+    return groups
 
 
 @click.command()
@@ -87,10 +111,39 @@ def get_groups_IMU() -> list[DataGroups]:
     "-k",
     "match_key",
     default="2023",
-    help="Partial key used to filter sequences for downloading"
-    "Default key value = 2023, which include all available sequences",
+    help=(
+        "Partial key used to filter sequences for downloading. "
+        "Default key value = 2023, which includes all available sequences."
+    ),
 )
-def main(url_json: Path, rootdir: Path, minimal: bool, overwrite: bool, match_key: str = "2023") -> None:
+@click.option(
+    "--video",
+    "include_video",
+    is_flag=True,
+    help=(
+        "Also download data.vrs (includes video streams). "
+        "Significantly larger than motion-only; omit for IMU/SLAM-only workflows."
+    ),
+)
+@click.option(
+    "--prune",
+    "prune",
+    is_flag=True,
+    help=(
+        "After downloading, delete any files on disk that don't belong to the "
+        "currently selected groups (e.g. semidense observations, et.vrs from old runs). "
+        "Will list what would be deleted and ask for confirmation before removing anything."
+    ),
+)
+def main(
+    url_json: Path,
+    rootdir: Path,
+    minimal: bool,
+    overwrite: bool,
+    match_key: str,
+    include_video: bool,
+    prune: bool,
+) -> None:
     logger.remove()
     logger.add(
         sys.stdout,
@@ -100,8 +153,14 @@ def main(url_json: Path, rootdir: Path, minimal: bool, overwrite: bool, match_ke
     )
 
     dl = DownloadManager(url_json, out_rootdir=rootdir)
-    groups = get_groups_IMU() if minimal else get_groups()
-    dl.download(match_key=match_key, selected_groups=groups, ignore_existing=not overwrite)
+    groups = get_groups_IMU(video=include_video) if minimal else get_groups(video=include_video)
+    dl.download(
+        match_key=match_key,
+        selected_groups=groups,
+        ignore_existing=not overwrite,
+        exclude_patterns=_EXCLUDE_PATTERNS,
+        prune=prune,
+    )
 
 
 if __name__ == "__main__":

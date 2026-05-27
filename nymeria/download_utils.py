@@ -73,7 +73,12 @@ class DlLink:
         )
         outdir.mkdir(exist_ok=True)
 
-    def get(self, outdir: Path, ignore_existing: bool = True) -> None:
+    def get(
+        self,
+        outdir: Path,
+        ignore_existing: bool = True,
+        exclude_patterns: list[str] | None = None,
+    ) -> None:
         """This function throws error if not successful"""
         flag = outdir / self.logdir / self.data_group.name
         if flag.is_file() and ignore_existing:
@@ -119,7 +124,13 @@ class DlLink:
                 with open(tmp_filename, "wb") as f:
                     sha1 = hashlib.sha1()
                     progress_bar = tqdm(
-                        total=self.file_size_bytes, unit="iB", unit_scale=True
+                        total=self.file_size_bytes,
+                        unit="iB",
+                        unit_scale=True,
+                        position=1,
+                        leave=False,
+                        desc=f"  {self.data_group.name}",
+                        dynamic_ncols=True,
                     )
                     for chunk in r.iter_content(
                         chunk_size=DlConfig.CHUCK_SIZE_BYTE.value
@@ -145,7 +156,14 @@ class DlLink:
             if is_zipfile(tmp_filename):
                 logger.info("unzip")
                 with ZipFile(tmp_filename) as zf:
-                    zf.extractall(outdir)
+                    members = zf.namelist()
+                    if exclude_patterns:
+                        excluded = [m for m in members if any(pat in m for pat in exclude_patterns)]
+                        members = [m for m in members if m not in excluded]
+                        if excluded:
+                            logger.info(f"Skipping {len(excluded)} excluded file(s): {excluded}")
+                    for member in members:
+                        zf.extract(member, outdir)
             else:
                 dst_file = outdir / self.data_group.value
                 dst_file.parent.mkdir(exist_ok=True, parents=True)
@@ -207,12 +225,18 @@ class DownloadManager:
         self,
         match_key: str,
         selected_groups: list["DataGroups"],
+        ignore_existing: bool = True,
+        prune_targets: list[Path] | None = None,
+        prune_freed_gb: float = 0.0,
     ) -> set["DataGroups"]:
         selected_groups += [DataGroups.LICENSE, DataGroups.metadata_json]
         selected_groups = set(selected_groups)
 
         num_seqs = 0
-        total_gb = 0
+        num_files = 0        # files that will actually be downloaded
+        num_skipped = 0      # files already on disk (flag present)
+        total_gb = 0         # full project size (all selected files)
+        pending_gb = 0       # size of files still to download
         self._logs = {}
 
         for seq, dgs in self.sequences.items():
@@ -221,24 +245,56 @@ class DownloadManager:
 
             num_seqs += 1
             self._logs[seq] = {}
+            outdir = self.out_rootdir / seq
             for dg in selected_groups:
                 if dg.name not in dgs:
                     self._logs[seq][dg.name] = DlStatus.WARN_NOTFOUND.value
                 else:
                     self._logs[seq][dg.name] = None
                     dl = DlLink(**{**dgs.get(dg.name, {}), "data_group": dg})
-                    total_gb += dl.file_size_bytes / (2**30)
+                    file_gb = dl.file_size_bytes / (2**30)
+                    total_gb += file_gb
+                    flag = outdir / dl.logdir / dg.name
+                    if flag.is_file() and ignore_existing:
+                        num_skipped += 1
+                    else:
+                        pending_gb += file_gb
+                        num_files += 1
 
-        # populate confirmation msg
-        msg = "\t" + "\n\t".join([x.value for x in selected_groups])
+        self._num_download_files = num_files + num_skipped  # total for outer bar
+
+        # Space check
         free_disk_gb = shutil.disk_usage(self.out_rootdir).free / (2**30)
+        effective_free_gb = free_disk_gb + prune_freed_gb
+        has_space = effective_free_gb >= pending_gb
+
+        # Build confirmation message
+        msg = "\t" + "\n\t".join([x.value for x in selected_groups])
+        skip_note = f" ({num_skipped} already downloaded, will be skipped)" if num_skipped else ""
+
+        prune_lines = ""
+        if prune_targets:
+            prune_lines = (
+                f"  Files to prune: {len(prune_targets)} ({prune_freed_gb:.2f} GB freed)\n"
+                f"  Effective free space after pruning (GB): {effective_free_gb:.2f}\n"
+            )
+
+        space_warning = "" if has_space else (
+            f"  ⚠  WARNING: effective free space ({effective_free_gb:.2f} GB) "
+            f"< download size ({pending_gb:.2f} GB) — may run out of disk!\n"
+        )
+
         confirm = (
             input(
                 f"Download summary\n"
                 f"  Output rootdir: {self.out_rootdir}\n"
-                f"  Number sequences: {num_seqs}\n"
-                f"  Total memory (GB): {total_gb}\n"
-                f"  Available free disk space (GB): {free_disk_gb}\n"
+                f"  Number of sequences: {num_seqs}\n"
+                f"  Total size (GB): {total_gb:.2f}\n"
+                f"  Files to download: {num_files}{skip_note}\n"
+                f"  Total size to download (GB): {pending_gb:.2f}\n"
+                f"{prune_lines}"
+                f"  Available free disk space (GB): {free_disk_gb:.2f}\n"
+                f"{space_warning}"
                 f"  Selected data groups:\n{msg}\n"
                 f"Proceed: [y/n] "
             ).lower()
@@ -247,6 +303,87 @@ class DownloadManager:
         if not confirm:
             exit(1)
         return selected_groups
+
+    def _compute_prune_targets(
+        self,
+        match_key: str,
+        selected_groups: set["DataGroups"],
+        exclude_patterns: list[str] | None = None,
+    ) -> tuple[list[Path], float]:
+        """
+        Dry-run: compute which files on disk don't belong to the selected groups.
+
+        L_expected  = file paths that should exist for the given groups
+        L_exists    = files currently on disk under out_rootdir
+        L_delete    = L_exists - L_expected
+
+        Returns (files_to_delete, freed_gb). Nothing is deleted.
+        """
+        from .definitions import get_group_definitions
+
+        group_defs = get_group_definitions()
+
+        # Build L_expected (posix paths relative to out_rootdir)
+        expected: set[str] = {"download_summary.json", "data_summary.json"}
+        for seq_name in self.sequences:
+            if match_key not in seq_name:
+                continue
+            for dg in selected_groups:
+                for rel in group_defs.get(dg.name, [dg.value]):
+                    if exclude_patterns and any(pat in rel for pat in exclude_patterns):
+                        continue
+                    expected.add(f"{seq_name}/{rel}")
+                # keep the "done" flag for this group
+                expected.add(f"{seq_name}/logs/{dg.name}")
+
+        # Build L_delete
+        to_delete: list[Path] = [
+            p for p in self.out_rootdir.rglob("*")
+            if p.is_file()
+            and p.relative_to(self.out_rootdir).as_posix() not in expected
+        ]
+        freed_gb = sum(p.stat().st_size for p in to_delete) / (2**30)
+        return to_delete, freed_gb
+
+    @staticmethod
+    def _execute_prune(to_delete: list[Path], out_rootdir: Path) -> None:
+        """Delete the given files and remove empty directories."""
+        for p in to_delete:
+            p.unlink()
+        for dirpath in sorted(out_rootdir.rglob("*"), reverse=True):
+            if dirpath.is_dir() and not any(dirpath.iterdir()):
+                dirpath.rmdir()
+
+    def prune(
+        self,
+        match_key: str,
+        selected_groups: set["DataGroups"],
+        exclude_patterns: list[str] | None = None,
+    ) -> None:
+        """
+        Standalone prune: list undesirable files, ask for confirmation, then delete.
+        For integrated prune+download (prune first, single confirmation), use
+        download(..., prune=True) instead.
+        """
+        to_delete, freed_gb = self._compute_prune_targets(
+            match_key, selected_groups, exclude_patterns
+        )
+
+        if not to_delete:
+            logger.info("Prune: nothing to remove.")
+            return
+
+        logger.warning(f"Prune: {len(to_delete)} files to delete ({freed_gb:.2f} GB will be freed)")
+        for p in sorted(to_delete):
+            logger.info(f"  - {p.relative_to(self.out_rootdir)}")
+
+        confirm = input("\nConfirm deletion? [y/n] ").lower() == "y"
+        if not confirm:
+            logger.info("Prune cancelled.")
+            return
+
+        self._execute_prune(to_delete, self.out_rootdir)
+        logger.info(f"Prune complete: {len(to_delete)} files deleted ({freed_gb:.2f} GB freed).")
 
     def __logging(self, **kwargs) -> None:
         self._logs.update(**kwargs)
@@ -259,8 +396,42 @@ class DownloadManager:
         match_key: str,
         selected_groups: list["DataGroups"],
         ignore_existing: bool = True,
+        exclude_patterns: list[str] | None = None,
+        prune: bool = False,
     ) -> None:
-        selected_groups = self.__prepare(match_key, selected_groups)
+        # Compute prune targets upfront so __prepare can show the full picture
+        # (freed space, effective free space, space check) in a single confirmation.
+        prune_targets: list[Path] = []
+        prune_freed_gb = 0.0
+        if prune:
+            # __prepare will add LICENSE + metadata_json; mirror that here so the
+            # expected-file set matches exactly what __prepare will use.
+            full_groups = set(list(selected_groups) + [DataGroups.LICENSE, DataGroups.metadata_json])
+            prune_targets, prune_freed_gb = self._compute_prune_targets(
+                match_key, full_groups, exclude_patterns
+            )
+
+        selected_groups = self.__prepare(
+            match_key,
+            selected_groups,
+            ignore_existing=ignore_existing,
+            prune_targets=prune_targets,
+            prune_freed_gb=prune_freed_gb,
+        )
+
+        # Prune first to free space before the download starts
+        if prune_targets:
+            self._execute_prune(prune_targets, self.out_rootdir)
+            logger.info(f"Pruned {len(prune_targets)} files ({prune_freed_gb:.2f} GB freed).")
+
+        num_files = self._num_download_files
+        outer_bar = tqdm(
+            total=num_files,
+            position=0,
+            unit="file",
+            desc="Overall",
+            dynamic_ncols=True,
+        )
 
         summary = {x.name: 0 for x in DlStatus}
         for seq_name, dgs in self.sequences.items():
@@ -273,15 +444,18 @@ class DownloadManager:
                     continue
 
                 dl = DlLink(**{**dgs[dg.name], "data_group": dg})
+                outer_bar.set_description(f"[{seq_name[-24:]}] {dg.name}")
                 try:
-                    dl.get(outdir, ignore_existing=ignore_existing)
+                    dl.get(outdir, ignore_existing=ignore_existing, exclude_patterns=exclude_patterns)
                 except Exception as e:
                     logger.error(f"downloading failure:, {e}")
 
+                outer_bar.update(1)
                 summary[dl.status.name] += 1
                 self._logs[dl.seq_name][dl.data_group.name] = dl.status.value
                 self.__logging()
 
+        outer_bar.close()
         self.__logging(download_summary=summary)
         logger.info(f"Dataset download to {self.out_rootdir}")
         logger.info(f"Brief download summary: {json.dumps(summary, indent=2)}")
