@@ -8,6 +8,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -27,6 +28,8 @@ class DlConfig(Enum):
     READ_BYTE = 4096
     RETRY = 5
     BACKOFF_FACTOR = 3
+    CONNECT_TIMEOUT = 30          # seconds to establish connection
+    STALL_MIN_BYTES = 1 << 20     # 1 MB — minimum progress per stall window
 
 
 class DlStatus(Enum):
@@ -37,6 +40,11 @@ class DlStatus(Enum):
     ERR_SHA1SUM = "error, sha1sum mismatch"
     ERR_MEMORY = "error, insufficient disk space"
     ERR_NETWORK = "error, network"
+    ERR_STALL = "error, download stalled — max retries exceeded"
+
+
+class StallError(Exception):
+    """Raised when download progress falls below the minimum threshold."""
 
 
 @dataclass
@@ -78,8 +86,17 @@ class DlLink:
         outdir: Path,
         ignore_existing: bool = True,
         exclude_patterns: list[str] | None = None,
+        stall_timeout: int = 30,
+        max_retries: int = 3,
     ) -> None:
-        """This function throws error if not successful"""
+        """
+        Download with stall detection and retry.
+
+        A stall is triggered when less than 1 MB is received within
+        `stall_timeout` seconds (either a completely frozen connection or a
+        slow drip).  On stall the attempt is aborted and retried up to
+        `max_retries` times total.
+        """
         flag = outdir / self.logdir / self.data_group.name
         if flag.is_file() and ignore_existing:
             self.status = DlStatus.IGNORED
@@ -87,27 +104,70 @@ class DlLink:
 
         self.__check_outdir(outdir)
 
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._attempt(outdir, exclude_patterns, stall_timeout)
+                break  # success — exit retry loop
+            except StallError as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Stall on {self.data_group.name} "
+                        f"(attempt {attempt}/{max_retries}): {e} — retrying..."
+                    )
+                else:
+                    # All attempts exhausted. Raise so the caller can log it;
+                    # the except Exception in DownloadManager.download() catches
+                    # this and continues with the next file.
+                    # No flag is written → this file will be retried on the next run.
+                    self.status = DlStatus.ERR_STALL
+                    raise RuntimeError(
+                        f"{self.data_group.name}: stalled after {max_retries} attempts — {e}"
+                    ) from e
+
+        logger.info(f"Downloaded {self.filename} → {outdir}")
+        self.status = DlStatus.SUCCESS
+        # Touch the "done" marker so subsequent runs skip this file.
+        # flag = outdir/logs/<group_name>; the logs/ dir may not exist yet.
+        flag.parent.mkdir(exist_ok=True)
+        flag.touch()
+
+    def _attempt(
+        self,
+        outdir: Path,
+        exclude_patterns: list[str] | None,
+        stall_timeout: int,
+    ) -> None:
+        """
+        Single download attempt.  Raises StallError on stall; raises
+        RuntimeError on unrecoverable errors (sha1, memory, HTTP).
+        """
+        session = requests.Session()
+        # Retry will be triggered for the following HTTP codes:
+        # 429 Too Many Requests, 500/502/503/504 server errors
+        retries = Retry(
+            total=DlConfig.RETRY.value,
+            backoff_factor=DlConfig.BACKOFF_FACTOR.value,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retries))
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_filename = Path(tmpdir) / self.filename
-            logger.info(f"Download {self.filename} -> {tmp_filename}")
+            logger.info(f"Download {self.filename} → {tmp_filename}")
 
-            session = requests.Session()
-            """
-            Retry will be triggered for the following cases
-            (429) Too Many Requests
-            (500) Internal Server Error
-            (502) Bad Gateway
-            (503) Service Unavailable
-            (504) Gateway Timeout
-            """
-            retries = Retry(
-                total=DlConfig.RETRY.value,
-                backoff_factor=DlConfig.BACKOFF_FACTOR.value,
-                status_forcelist=[429, 500, 502, 503, 504],
-            )
+            try:
+                r_ctx = session.get(
+                    self.download_url,
+                    stream=True,
+                    # read_timeout fires if no bytes arrive within stall_timeout seconds,
+                    # covering the "completely frozen connection" case.
+                    timeout=(DlConfig.CONNECT_TIMEOUT.value, stall_timeout),
+                )
+            except requests.exceptions.ConnectionError as e:
+                self.status = DlStatus.ERR_NETWORK
+                raise RuntimeError(f"Connection error: {e}") from e
 
-            session.mount("https://", HTTPAdapter(max_retries=retries))
-            with session.get(self.download_url, stream=True) as r:
+            with r_ctx as r:
                 free_outdir = shutil.disk_usage(outdir).free
                 free_tmpdir = shutil.disk_usage(tmpdir).free
                 if (
@@ -132,49 +192,73 @@ class DlLink:
                         desc=f"  {self.data_group.name}",
                         dynamic_ncols=True,
                     )
-                    for chunk in r.iter_content(
-                        chunk_size=DlConfig.CHUCK_SIZE_BYTE.value
-                    ):
-                        progress_bar.update(len(chunk))
-                        f.write(chunk)
-                        sha1.update(chunk)
+
+                    window_start = time.monotonic()
+                    bytes_in_window = 0
+
+                    try:
+                        for chunk in r.iter_content(
+                            chunk_size=DlConfig.CHUCK_SIZE_BYTE.value
+                        ):
+                            progress_bar.update(len(chunk))
+                            f.write(chunk)
+                            sha1.update(chunk)
+
+                            # Rate check: slow-drip stall detection
+                            bytes_in_window += len(chunk)
+                            elapsed = time.monotonic() - window_start
+                            if elapsed >= stall_timeout:
+                                if bytes_in_window < DlConfig.STALL_MIN_BYTES.value:
+                                    raise StallError(
+                                        f"{bytes_in_window / 1024:.1f} KB in "
+                                        f"{elapsed:.0f}s "
+                                        f"(threshold: 1 MB / {stall_timeout}s)"
+                                    )
+                                bytes_in_window = 0
+                                window_start = time.monotonic()
+
+                    except requests.exceptions.ReadTimeout:
+                        # Connection-level stall: no bytes at all for stall_timeout s
+                        raise StallError(
+                            f"no data received for {stall_timeout}s"
+                        )
+                    finally:
+                        progress_bar.close()
+
                     computed = sha1.hexdigest()
                     if self.sha1sum != computed:
                         self.status = DlStatus.ERR_SHA1SUM
                         raise RuntimeError(
                             f"sha1sum mismatch, computed {computed}, expected {self.sha1sum}"
                         )
-                    progress_bar.close()
 
                 try:
                     r.raise_for_status()
                 except Exception as e:
                     self.status = DlStatus.ERR_NETWORK
-                    raise RuntimeError(e)
+                    raise RuntimeError(e) from e
 
-            # move from tmp -> dst
+            # move from tmp → dst
             if is_zipfile(tmp_filename):
                 logger.info("unzip")
                 with ZipFile(tmp_filename) as zf:
                     members = zf.namelist()
                     if exclude_patterns:
-                        excluded = [m for m in members if any(pat in m for pat in exclude_patterns)]
+                        excluded = [
+                            m for m in members
+                            if any(pat in m for pat in exclude_patterns)
+                        ]
                         members = [m for m in members if m not in excluded]
                         if excluded:
-                            logger.info(f"Skipping {len(excluded)} excluded file(s): {excluded}")
+                            logger.info(
+                                f"Skipping {len(excluded)} excluded file(s): {excluded}"
+                            )
                     for member in members:
                         zf.extract(member, outdir)
             else:
                 dst_file = outdir / self.data_group.value
                 dst_file.parent.mkdir(exist_ok=True, parents=True)
                 shutil.move(src=tmp_filename, dst=dst_file)
-
-        logger.info(f"Download {self.filename} -> {outdir}")
-        self.status = DlStatus.SUCCESS
-
-        # create a flag
-        flag.parent.mkdir(exist_ok=True)
-        flag.touch()
 
 
 class DownloadManager:
@@ -398,6 +482,8 @@ class DownloadManager:
         ignore_existing: bool = True,
         exclude_patterns: list[str] | None = None,
         prune: bool = False,
+        stall_timeout: int = 30,
+        max_retries: int = 3,
     ) -> None:
         # Compute prune targets upfront so __prepare can show the full picture
         # (freed space, effective free space, space check) in a single confirmation.
@@ -446,7 +532,13 @@ class DownloadManager:
                 dl = DlLink(**{**dgs[dg.name], "data_group": dg})
                 outer_bar.set_description(f"[{seq_name[-24:]}] {dg.name}")
                 try:
-                    dl.get(outdir, ignore_existing=ignore_existing, exclude_patterns=exclude_patterns)
+                    dl.get(
+                        outdir,
+                        ignore_existing=ignore_existing,
+                        exclude_patterns=exclude_patterns,
+                        stall_timeout=stall_timeout,
+                        max_retries=max_retries,
+                    )
                 except Exception as e:
                     logger.error(f"downloading failure:, {e}")
 

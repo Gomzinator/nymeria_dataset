@@ -130,9 +130,28 @@ def get_groups_IMU(video: bool = False) -> list[DataGroups]:
     "prune",
     is_flag=True,
     help=(
-        "After downloading, delete any files on disk that don't belong to the "
-        "currently selected groups (e.g. semidense observations, et.vrs from old runs). "
-        "Will list what would be deleted and ask for confirmation before removing anything."
+        "Before downloading, delete any files on disk that don't belong to the "
+        "currently selected groups (frees space before the download starts). "
+        "Shown in the confirmation prompt — a single [y/n] covers both prune and download."
+    ),
+)
+@click.option(
+    "--max-retry",
+    "max_retries",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Number of times to retry a stalled download before giving up.",
+)
+@click.option(
+    "--stall-timeout",
+    "stall_timeout",
+    default=30,
+    show_default=True,
+    type=int,
+    help=(
+        "Seconds window used to detect a stall: if less than 1 MB is received "
+        "within this window the download is aborted and retried."
     ),
 )
 def main(
@@ -143,6 +162,8 @@ def main(
     match_key: str,
     include_video: bool,
     prune: bool,
+    max_retries: int,
+    stall_timeout: int,
 ) -> None:
     logger.remove()
     logger.add(
@@ -160,6 +181,8 @@ def main(
         ignore_existing=not overwrite,
         exclude_patterns=_EXCLUDE_PATTERNS,
         prune=prune,
+        stall_timeout=stall_timeout,
+        max_retries=max_retries,
     )
 
 
