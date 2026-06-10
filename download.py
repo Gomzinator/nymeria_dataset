@@ -31,34 +31,43 @@ _VIDEO_EXCLUDE_PATTERNS = [
 ]
 
 
-def get_groups(video: bool = False) -> list[DataGroups]:
+def get_groups(
+    video: bool = False,
+    body: bool = False,
+    narration: bool = False,
+    semidense: bool = False,
+) -> list[DataGroups]:
     """
-    Full download: body, all recordings, narrations, raw Xsens.
+    Build the list of data groups to download.
 
-    Files included per recording_head / recording_observer group (zip):
-      - motion.vrs  — IMU + audio, no video (always downloaded)
-      - et.vrs      — eye tracking (always excluded via _EXCLUDE_PATTERNS)
-      - mps/slam/   — SLAM trajectories & calibration
-      - mps/eye_gaze/ — gaze CSVs
+    Core (always downloaded) — the minimal IMU/SLAM set:
+      - LICENSE, metadata.json
+      - recording_head / recording_observer  (motion.vrs + SLAM + gaze; et.vrs
+        stripped via _EXCLUDE_PATTERNS)
+      - recording_lwrist / recording_rwrist  (motion.vrs + SLAM)
 
-    Pass video=True (--video flag) to also fetch data.vrs, which is the
-    full-sensor VRS with video streams on top of motion data.
+    Everything else is opt-in via a flag (each flag just appends its groups):
+      - video=True  (--video)      → data.vrs full-sensor recording (with video)
+                                      for head/observer; motion.vrs is then
+                                      pruned/stripped (see _VIDEO_EXCLUDE_PATTERNS).
+      - body=True   (--body)       → the whole body/ dir: xdata.npz +
+                                      xdata_blueman.glb (body_motion) and the raw
+                                      xdata.mvnx (body_xdata_mvnx).
+      - narration=True (--narration) → the three narration CSVs.
+      - semidense=True (--semi-dense) → semidense point cloud: keeps the
+                                      semidense_points.csv.gz bundled in each
+                                      recording zip AND downloads the standalone
+                                      semidense_observations.csv.gz (large).
 
-    semidense_observations (3D point cloud) is excluded by default.
+    Anything not selected here is removed from disk by --prune.
     """
     groups = [
         DataGroups.LICENSE,
         DataGroups.metadata_json,
-        DataGroups.body_motion,
         DataGroups.recording_head,       # motion.vrs + SLAM + gaze (et.vrs stripped)
         DataGroups.recording_lwrist,
         DataGroups.recording_rwrist,
         DataGroups.recording_observer,   # motion.vrs + SLAM + gaze (et.vrs stripped)
-        DataGroups.narration_motion_narration_csv,
-        DataGroups.narration_atomic_action_csv,
-        DataGroups.narration_activity_summarization_csv,
-        # DataGroups.semidense_observations,  # 3D point cloud — large, opt-in only
-        DataGroups.body_xdata_mvnx,
     ]
     if video:
         # data.vrs is the full-sensor recording including all video streams;
@@ -67,29 +76,21 @@ def get_groups(video: bool = False) -> list[DataGroups]:
             DataGroups.recording_head_data_data_vrs,
             DataGroups.recording_observer_data_data_vrs,
         ]
-    return groups
-
-
-def get_groups_IMU(video: bool = False) -> list[DataGroups]:
-    """
-    Minimal download for VIO post-processing: recordings + body motion only,
-    no narrations.  Same et.vrs / semidense exclusion rules as get_groups().
-    """
-    groups = [
-        DataGroups.LICENSE,
-        DataGroups.metadata_json,
-        DataGroups.body_motion,
-        DataGroups.recording_head,
-        DataGroups.recording_lwrist,
-        DataGroups.recording_rwrist,
-        DataGroups.recording_observer,
-        DataGroups.body_xdata_mvnx,
-    ]
-    if video:
+    if body:
         groups += [
-            DataGroups.recording_head_data_data_vrs,
-            DataGroups.recording_observer_data_data_vrs,
+            DataGroups.body_motion,      # xdata.npz + xdata_blueman.glb
+            DataGroups.body_xdata_mvnx,  # raw xdata.mvnx
         ]
+    if narration:
+        groups += [
+            DataGroups.narration_motion_narration_csv,
+            DataGroups.narration_atomic_action_csv,
+            DataGroups.narration_activity_summarization_csv,
+        ]
+    if semidense:
+        # Selecting this group both keeps the (already-bundled) semidense_points
+        # and downloads the standalone semidense_observations point cloud.
+        groups += [DataGroups.semidense_observations]
     return groups
 
 
@@ -108,12 +109,6 @@ def get_groups_IMU(video: bool = False) -> list[DataGroups]:
     type=click.Path(file_okay=False, dir_okay=True, writable=True, path_type=Path),
     default=None,
     help="The root directory to hold the downloaded dataset",
-)
-@click.option(
-    "-m",
-    "minimal",
-    is_flag=True,
-    help="Download only the minimum required groups for VIO post processing",
 )
 @click.option(
     "-f",
@@ -135,9 +130,37 @@ def get_groups_IMU(video: bool = False) -> list[DataGroups]:
     "include_video",
     is_flag=True,
     help=(
-        "Also download data.vrs (includes video streams). "
+        "Also download data.vrs (includes video streams) for head/observer. "
         "Significantly larger than motion-only; omit for IMU/SLAM-only workflows."
     ),
+)
+@click.option(
+    "--body",
+    "include_body",
+    is_flag=True,
+    help="Also download the body/ data (xdata.npz, xdata_blueman.glb, xdata.mvnx).",
+)
+@click.option(
+    "--narration",
+    "include_narration",
+    is_flag=True,
+    help="Also download the narration CSVs (motion / atomic action / activity summary).",
+)
+@click.option(
+    "--semi-dense",
+    "include_semidense",
+    is_flag=True,
+    help=(
+        "Also keep/download the semi-dense point cloud: semidense_points.csv.gz "
+        "(bundled in each recording zip) and the standalone "
+        "semidense_observations.csv.gz (large). Without this flag they are pruned."
+    ),
+)
+@click.option(
+    "--all",
+    "include_all",
+    is_flag=True,
+    help="Download everything: equivalent to --video --body --narration --semi-dense.",
 )
 @click.option(
     "--prune",
@@ -171,10 +194,13 @@ def get_groups_IMU(video: bool = False) -> list[DataGroups]:
 def main(
     url_json: Path,
     rootdir: Path,
-    minimal: bool,
     overwrite: bool,
     match_key: str,
     include_video: bool,
+    include_body: bool,
+    include_narration: bool,
+    include_semidense: bool,
+    include_all: bool,
     prune: bool,
     max_retries: int,
     stall_timeout: int,
@@ -187,8 +213,17 @@ def main(
         level="INFO",
     )
 
+    # --all is shorthand for turning on every opt-in group.
+    if include_all:
+        include_video = include_body = include_narration = include_semidense = True
+
     dl = DownloadManager(url_json, out_rootdir=rootdir)
-    groups = get_groups_IMU(video=include_video) if minimal else get_groups(video=include_video)
+    groups = get_groups(
+        video=include_video,
+        body=include_body,
+        narration=include_narration,
+        semidense=include_semidense,
+    )
 
     exclude_patterns = list(_EXCLUDE_PATTERNS)
     if include_video:

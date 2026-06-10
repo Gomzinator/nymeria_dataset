@@ -527,6 +527,13 @@ class DownloadManager:
             outdir = self.out_rootdir / seq_name
             for dg in selected_groups:
                 if dg.name not in dgs:
+                    # Selected, but this sequence has no download link for it.
+                    # Count + log it so missing data is visible in the summary
+                    # instead of being silently skipped. (Not counted toward the
+                    # outer progress bar, which only tracks downloadable files.)
+                    summary[DlStatus.WARN_NOTFOUND.name] += 1
+                    self._logs[seq_name][dg.name] = DlStatus.WARN_NOTFOUND.value
+                    self.__logging()
                     continue
 
                 dl = DlLink(**{**dgs[dg.name], "data_group": dg})

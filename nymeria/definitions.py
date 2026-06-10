@@ -150,14 +150,24 @@ def get_group_definitions() -> dict[str, list]:
            There is one url per data group per sequence.
            Data groups with multiple files are packed into zip files.
     """
+    # Both semi-dense point-cloud files (semidense_points + semidense_observations)
+    # are owned by the semidense_observations data group, not the recording groups,
+    # so they are kept/pruned together via the --semi-dense flag. Exclude them here.
+    def _slam_no_semidense():
+        return [
+            f.default
+            for f in fields(SlamFiles)
+            if "observations" not in f.name and "points" not in f.name
+        ]
+
     AriaFiles = (
         [f.default for f in fields(VrsFiles) if "data" not in f.name]
-        + [f.default for f in fields(SlamFiles) if "observations" not in f.name]
+        + _slam_no_semidense()
         + [f.default for f in fields(GazeFiles)]
     )
-    miniAriaFiles = [f.default for f in fields(VrsFiles) if "et" not in f.name] + [
-        f.default for f in fields(SlamFiles) if "observations" not in f.name
-    ]
+    miniAriaFiles = [
+        f.default for f in fields(VrsFiles) if "et" not in f.name
+    ] + _slam_no_semidense()
 
     g_defs = {x.name: [x.value] for x in DataGroups}
     g_defs[DataGroups.body_motion.name] = [x.default for x in fields(BodyFiles)]
@@ -170,12 +180,16 @@ def get_group_definitions() -> dict[str, list]:
     for x in [DataGroups.recording_rwrist, DataGroups.recording_lwrist]:
         g_defs[x.name] = [f"{x.name}/{f}" for f in miniAriaFiles]
 
+    # The semidense group owns both point-cloud files for every recording:
+    #  - semidense_points.csv.gz       (bundled inside each recording zip)
+    #  - semidense_observations.csv.gz (standalone download)
     g_defs[DataGroups.semidense_observations.name] = []
     for x in fields(Subpaths):
         if "recording" in x.name:
-            g_defs[DataGroups.semidense_observations.name].append(
-                f"{x.default}/{SlamFiles.semidense_observations}"
-            )
+            g_defs[DataGroups.semidense_observations.name] += [
+                f"{x.default}/{SlamFiles.semidense_points}",
+                f"{x.default}/{SlamFiles.semidense_observations}",
+            ]
 
     return g_defs
 
