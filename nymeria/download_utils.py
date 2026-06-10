@@ -21,6 +21,12 @@ from requests.packages.urllib3.util.retry import Retry
 from tqdm import tqdm
 
 from .definitions import DataGroups, NYMERIA_VERSION
+from .manifest import (
+    blank_was_downloaded,
+    build_has,
+    scan_was_downloaded,
+    write_manifest,
+)
 
 
 class DlConfig(Enum):
@@ -505,6 +511,17 @@ class DownloadManager:
             prune_freed_gb=prune_freed_gb,
         )
 
+        # Capability manifest (write-only; never read back). Build `has` from the
+        # input json up front so it survives an interrupted download; the
+        # `was_downloaded` view is a placeholder for now and gets the real
+        # on-disk values at the end. Covers every sequence in the input json,
+        # independent of match_key / selected_groups.
+        seq_names = list(self.sequences.keys())
+        manifest_has = build_has(self.sequences)
+        write_manifest(
+            self.out_rootdir, manifest_has, blank_was_downloaded(seq_names)
+        )
+
         # Prune first to free space before the download starts
         if prune_targets:
             self._execute_prune(prune_targets, self.out_rootdir)
@@ -556,6 +573,14 @@ class DownloadManager:
 
         outer_bar.close()
         self.__logging(download_summary=summary)
+
+        # Refresh the manifest with what actually landed on disk.
+        write_manifest(
+            self.out_rootdir,
+            manifest_has,
+            scan_was_downloaded(self.out_rootdir, seq_names),
+        )
+
         logger.info(f"Dataset download to {self.out_rootdir}")
         logger.info(f"Brief download summary: {json.dumps(summary, indent=2)}")
         logger.info(f"Detailed summary saved to {self.logfile}")
