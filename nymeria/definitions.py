@@ -138,7 +138,7 @@ class DataGroups(Enum):
 
     semidense_observations = "semidense_observations"
 
-    body_xdata_mvnx = "body_xdata_mvnx"
+    body_xdata_mvnx = BodyFiles.xsens_raw  # "body/xdata.mvnx" — raw Xsens, downloaded standalone
 
 
 def get_group_definitions() -> dict[str, list]:

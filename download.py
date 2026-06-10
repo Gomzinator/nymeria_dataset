@@ -9,12 +9,26 @@ from pathlib import Path
 
 import click
 from loguru import logger
-from nymeria.definitions import DataGroups
+from nymeria.definitions import DataGroups, VrsFiles
 from nymeria.download_utils import DownloadManager
 
 # et.vrs (eye-tracking) is always excluded from extraction — it is bundled inside
 # the recording_head / recording_observer zips but stripped out on unzip.
 _EXCLUDE_PATTERNS = ["et.vrs"]
+
+# When --video is set, data.vrs (full-sensor, with video) replaces the
+# motion-only motion.vrs for the head and observer recordings. These two
+# recordings have a *standalone* data.vrs download group, so dropping their
+# motion.vrs is safe — the equivalent (richer) data is fetched separately.
+#
+# Scope is deliberately head/observer only: the wrist recordings have NO
+# separate data.vrs download, so a bare "motion.vrs" pattern would prune the
+# wrist motion.vrs (and, on a skip-existing re-run, nothing would replace it,
+# leaving recording_*wrist/data empty). VrsFiles.motion == "data/motion.vrs".
+_VIDEO_EXCLUDE_PATTERNS = [
+    f"{DataGroups.recording_head.value}/{VrsFiles.motion}",
+    f"{DataGroups.recording_observer.value}/{VrsFiles.motion}",
+]
 
 
 def get_groups(video: bool = False) -> list[DataGroups]:
@@ -175,11 +189,18 @@ def main(
 
     dl = DownloadManager(url_json, out_rootdir=rootdir)
     groups = get_groups_IMU(video=include_video) if minimal else get_groups(video=include_video)
+
+    exclude_patterns = list(_EXCLUDE_PATTERNS)
+    if include_video:
+        # Drop head/observer motion.vrs; data.vrs supersedes it. With --prune the
+        # already-on-disk motion.vrs is deleted; on a fresh unzip it is stripped.
+        exclude_patterns += _VIDEO_EXCLUDE_PATTERNS
+
     dl.download(
         match_key=match_key,
         selected_groups=groups,
         ignore_existing=not overwrite,
-        exclude_patterns=_EXCLUDE_PATTERNS,
+        exclude_patterns=exclude_patterns,
         prune=prune,
         stall_timeout=stall_timeout,
         max_retries=max_retries,
