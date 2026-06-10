@@ -9,17 +9,19 @@ from pathlib import Path
 
 import click
 from loguru import logger
-from nymeria.definitions import DataGroups, VrsFiles
+from nymeria.definitions import DataGroups, Subpaths, VrsFiles
 from nymeria.download_utils import DownloadManager
 
 # et.vrs (eye-tracking) is always excluded from extraction — it is bundled inside
 # the recording_head / recording_observer zips but stripped out on unzip.
 _EXCLUDE_PATTERNS = ["et.vrs"]
 
-# When --video is set, data.vrs (full-sensor, with video) replaces the
+# Video is on by default: data.vrs (full-sensor, with video) replaces the
 # motion-only motion.vrs for the head and observer recordings. These two
 # recordings have a *standalone* data.vrs download group, so dropping their
 # motion.vrs is safe — the equivalent (richer) data is fetched separately.
+# With --no-video we instead skip data.vrs and keep motion.vrs (these patterns
+# are NOT applied).
 #
 # Scope is deliberately head/observer only: the wrist recordings have NO
 # separate data.vrs download, so a bare "motion.vrs" pattern would prune the
@@ -30,36 +32,47 @@ _VIDEO_EXCLUDE_PATTERNS = [
     f"{DataGroups.recording_observer.value}/{VrsFiles.motion}",
 ]
 
+# Eye-gaze CSVs (general/personalized) are bundled in the head/observer zips and
+# kept by default. --no-gaze strips them on unzip and prunes any already on disk.
+# Subpaths.mps_gaze == "mps/eye_gaze" (only present under head/observer).
+_GAZE_EXCLUDE_PATTERNS = [Subpaths.mps_gaze]
+
 
 def get_groups(
-    video: bool = False,
-    body: bool = False,
-    narration: bool = False,
-    semidense: bool = False,
+    video: bool = True,
+    body: bool = True,
+    narration: bool = True,
+    semidense: bool = True,
 ) -> list[DataGroups]:
     """
     Build the list of data groups to download.
 
-    Core (always downloaded) — the minimal IMU/SLAM set:
+    Everything is included by default; each group can be turned off from the CLI
+    with its --no-* flag (which flips the matching argument here to False).
+
+    Core (always downloaded):
       - LICENSE, metadata.json
       - recording_head / recording_observer  (motion.vrs + SLAM + gaze; et.vrs
         stripped via _EXCLUDE_PATTERNS)
       - recording_lwrist / recording_rwrist  (motion.vrs + SLAM)
 
-    Everything else is opt-in via a flag (each flag just appends its groups):
-      - video=True  (--video)      → data.vrs full-sensor recording (with video)
-                                      for head/observer; motion.vrs is then
-                                      pruned/stripped (see _VIDEO_EXCLUDE_PATTERNS).
-      - body=True   (--body)       → the whole body/ dir: xdata.npz +
-                                      xdata_blueman.glb (body_motion) and the raw
-                                      xdata.mvnx (body_xdata_mvnx).
-      - narration=True (--narration) → the three narration CSVs.
-      - semidense=True (--semi-dense) → semidense point cloud: keeps the
-                                      semidense_points.csv.gz bundled in each
-                                      recording zip AND downloads the standalone
-                                      semidense_observations.csv.gz (large).
+    Toggleable groups (on unless the --no-* flag is given):
+      - video      (--no-video)      → data.vrs full-sensor recording (with video)
+                                       for head/observer; motion.vrs is then
+                                       pruned/stripped (see _VIDEO_EXCLUDE_PATTERNS).
+                                       --no-video keeps motion.vrs instead.
+      - body       (--no-body)       → the whole body/ dir: xdata.npz +
+                                       xdata_blueman.glb (body_motion) and the raw
+                                       xdata.mvnx (body_xdata_mvnx).
+      - narration  (--no-narration)  → the three narration CSVs.
+      - semidense  (--no-semi-dense) → semidense point cloud: keeps the
+                                       semidense_points.csv.gz bundled in each
+                                       recording zip AND downloads the standalone
+                                       semidense_observations.csv.gz (large).
 
-    Anything not selected here is removed from disk by --prune.
+    Eye gaze (--no-gaze) is handled separately via _GAZE_EXCLUDE_PATTERNS, not
+    here, since it has no standalone download group. Anything not selected is
+    removed from disk by --prune.
     """
     groups = [
         DataGroups.LICENSE,
@@ -126,41 +139,41 @@ def get_groups(
     ),
 )
 @click.option(
-    "--video",
-    "include_video",
+    "--no-video",
+    "no_video",
     is_flag=True,
     help=(
-        "Also download data.vrs (includes video streams) for head/observer. "
-        "Significantly larger than motion-only; omit for IMU/SLAM-only workflows."
+        "Skip data.vrs (video streams) for head/observer and keep motion.vrs "
+        "instead. Use for IMU/SLAM-only workflows; saves a lot of space."
     ),
 )
 @click.option(
-    "--body",
-    "include_body",
+    "--no-body",
+    "no_body",
     is_flag=True,
-    help="Also download the body/ data (xdata.npz, xdata_blueman.glb, xdata.mvnx).",
+    help="Skip the body/ data (xdata.npz, xdata_blueman.glb, xdata.mvnx).",
 )
 @click.option(
-    "--narration",
-    "include_narration",
+    "--no-narration",
+    "no_narration",
     is_flag=True,
-    help="Also download the narration CSVs (motion / atomic action / activity summary).",
+    help="Skip the narration CSVs (motion / atomic action / activity summary).",
 )
 @click.option(
-    "--semi-dense",
-    "include_semidense",
+    "--no-semi-dense",
+    "no_semidense",
     is_flag=True,
     help=(
-        "Also keep/download the semi-dense point cloud: semidense_points.csv.gz "
-        "(bundled in each recording zip) and the standalone "
-        "semidense_observations.csv.gz (large). Without this flag they are pruned."
+        "Skip the semi-dense point cloud: semidense_points.csv.gz (bundled in "
+        "each recording zip) and the standalone semidense_observations.csv.gz "
+        "(large). They are pruned if already on disk."
     ),
 )
 @click.option(
-    "--all",
-    "include_all",
+    "--no-gaze",
+    "no_gaze",
     is_flag=True,
-    help="Download everything: equivalent to --video --body --narration --semi-dense.",
+    help="Strip the eye_gaze CSVs (general/personalized) from head/observer.",
 )
 @click.option(
     "--prune",
@@ -196,11 +209,11 @@ def main(
     rootdir: Path,
     overwrite: bool,
     match_key: str,
-    include_video: bool,
-    include_body: bool,
-    include_narration: bool,
-    include_semidense: bool,
-    include_all: bool,
+    no_video: bool,
+    no_body: bool,
+    no_narration: bool,
+    no_semidense: bool,
+    no_gaze: bool,
     prune: bool,
     max_retries: int,
     stall_timeout: int,
@@ -213,23 +226,24 @@ def main(
         level="INFO",
     )
 
-    # --all is shorthand for turning on every opt-in group.
-    if include_all:
-        include_video = include_body = include_narration = include_semidense = True
-
     dl = DownloadManager(url_json, out_rootdir=rootdir)
+    # Everything is on by default; each --no-* flag turns one group off.
     groups = get_groups(
-        video=include_video,
-        body=include_body,
-        narration=include_narration,
-        semidense=include_semidense,
+        video=not no_video,
+        body=not no_body,
+        narration=not no_narration,
+        semidense=not no_semidense,
     )
 
     exclude_patterns = list(_EXCLUDE_PATTERNS)
-    if include_video:
-        # Drop head/observer motion.vrs; data.vrs supersedes it. With --prune the
-        # already-on-disk motion.vrs is deleted; on a fresh unzip it is stripped.
+    if not no_video:
+        # Default: drop head/observer motion.vrs; data.vrs supersedes it. With
+        # --prune the already-on-disk motion.vrs is deleted; on a fresh unzip it
+        # is stripped. --no-video skips this so motion.vrs is kept.
         exclude_patterns += _VIDEO_EXCLUDE_PATTERNS
+    if no_gaze:
+        # Strip eye_gaze on unzip and drop it from the prune expected-set.
+        exclude_patterns += _GAZE_EXCLUDE_PATTERNS
 
     dl.download(
         match_key=match_key,

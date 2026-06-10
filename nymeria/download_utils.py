@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from .definitions import DataGroups, NYMERIA_VERSION
 from .manifest import (
+    MANIFEST_FILENAME,
     blank_was_downloaded,
     build_has,
     scan_was_downloaded,
@@ -265,6 +266,11 @@ class DlLink:
                 dst_file = outdir / self.data_group.value
                 dst_file.parent.mkdir(exist_ok=True, parents=True)
                 shutil.move(src=tmp_filename, dst=dst_file)
+                # tempfile creates the staged file 0600 and shutil.move preserves
+                # that, leaving non-zip downloads (data.vrs, mvnx, CSVs) owner-only
+                # while zip-extracted files inherit the share's perms. Match the
+                # parent directory so all files in the tree are consistent.
+                shutil.copymode(dst_file.parent, dst_file)
 
 
 class DownloadManager:
@@ -413,8 +419,13 @@ class DownloadManager:
 
         group_defs = get_group_definitions()
 
-        # Build L_expected (posix paths relative to out_rootdir)
-        expected: set[str] = {"download_summary.json", "data_summary.json"}
+        # Build L_expected (posix paths relative to out_rootdir). The top-level
+        # bookkeeping files we emit must never be pruned.
+        expected: set[str] = {
+            "download_summary.json",
+            "data_summary.json",
+            MANIFEST_FILENAME,
+        }
         for seq_name in self.sequences:
             if match_key not in seq_name:
                 continue
