@@ -23,13 +23,22 @@ _EXCLUDE_PATTERNS = ["et.vrs"]
 # With --no-video we instead skip data.vrs and keep motion.vrs (these patterns
 # are NOT applied).
 #
-# Scope is deliberately head/observer only: the wrist recordings have NO
-# separate data.vrs download, so a bare "motion.vrs" pattern would prune the
-# wrist motion.vrs (and, on a skip-existing re-run, nothing would replace it,
-# leaving recording_*wrist/data empty). VrsFiles.motion == "data/motion.vrs".
+# Scope is deliberately head/observer only: their data.vrs lives in the base
+# release json. The wrists get the same treatment only under --wrist-video (see
+# below), because their data.vrs comes from a different json and is opt-in.
+# VrsFiles.motion == "data/motion.vrs".
 _VIDEO_EXCLUDE_PATTERNS = [
     f"{DataGroups.recording_head.value}/{VrsFiles.motion}",
     f"{DataGroups.recording_observer.value}/{VrsFiles.motion}",
+]
+
+# Same rule applied to the wrists, but only when --wrist-video is given: their
+# standalone data.vrs (SLAM camera + IMU) then supersedes motion.vrs. Without
+# the flag these patterns are NOT applied — otherwise the wrist motion.vrs would
+# be pruned with nothing to replace it, leaving recording_*wrist/data empty.
+_WRIST_VIDEO_EXCLUDE_PATTERNS = [
+    f"{DataGroups.recording_lwrist.value}/{VrsFiles.motion}",
+    f"{DataGroups.recording_rwrist.value}/{VrsFiles.motion}",
 ]
 
 # Eye-gaze CSVs (general/personalized) are bundled in the head/observer zips and
@@ -43,6 +52,7 @@ def get_groups(
     body: bool = True,
     narration: bool = True,
     semidense: bool = True,
+    wrist_video: bool = False,
 ) -> list[DataGroups]:
     """
     Build the list of data groups to download.
@@ -69,6 +79,15 @@ def get_groups(
                                        semidense_points.csv.gz bundled in each
                                        recording zip AND downloads the standalone
                                        semidense_observations.csv.gz (large).
+
+    Opt-in group (OFF unless the flag is given):
+      - wrist_video (--wrist-video)  → data.vrs (SLAM camera + IMU) for
+                                       recording_lwrist / recording_rwrist. Only
+                                       present in the NymeriaPlus url json, so
+                                       that json must be passed with -i as well.
+                                       ~11 TiB for the full 1100 sequences, hence
+                                       opt-in. Wrist motion.vrs is then pruned/
+                                       stripped (see _WRIST_VIDEO_EXCLUDE_PATTERNS).
 
     Eye gaze (--no-gaze) is handled separately via _GAZE_EXCLUDE_PATTERNS, not
     here, since it has no standalone download group. Anything not selected is
@@ -104,6 +123,11 @@ def get_groups(
         # Selecting this group both keeps the (already-bundled) semidense_points
         # and downloads the standalone semidense_observations point cloud.
         groups += [DataGroups.semidense_observations]
+    if wrist_video:
+        groups += [
+            DataGroups.recording_lwrist_data_data_vrs,
+            DataGroups.recording_rwrist_data_data_vrs,
+        ]
     return groups
 
 
@@ -114,7 +138,13 @@ def get_groups(
     type=click.Path(file_okay=True, dir_okay=False, path_type=Path),
     default=None,
     required=True,
-    help="The json file contains download urls. Follow README.md instructions to access this file.",
+    multiple=True,
+    help=(
+        "The json file that contains download urls. Follow README.md instructions "
+        "to access this file. Repeat -i to merge several jsons — needed for "
+        "--wrist-video, whose links live in the NymeriaPlus json: "
+        "-i nymeria_all_urls.json -i nymeria_plus_download_urls.json"
+    ),
 )
 @click.option(
     "-o",
@@ -145,6 +175,17 @@ def get_groups(
     help=(
         "Skip data.vrs (video streams) for head/observer and keep motion.vrs "
         "instead. Use for IMU/SLAM-only workflows; saves a lot of space."
+    ),
+)
+@click.option(
+    "--wrist-video",
+    "wrist_video",
+    is_flag=True,
+    help=(
+        "Download data.vrs (SLAM camera + IMU) for both wrists and drop their "
+        "motion.vrs, mirroring the head/observer behaviour. Links come from the "
+        "NymeriaPlus json, so pass it with an extra -i. ~11 TiB for all 1100 "
+        "sequences — narrow the set with -k."
     ),
 )
 @click.option(
@@ -186,6 +227,17 @@ def get_groups(
     ),
 )
 @click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    help=(
+        "Print what would be done (download / re-download / prune, sizes and the "
+        "motion.vrs<->data.vrs swaps) and exit without downloading, pruning, or "
+        "touching the network. Combine with --prune, --no-video, --wrist-video, "
+        "etc. to preview a selection change before running it for real."
+    ),
+)
+@click.option(
     "--max-retry",
     "max_retries",
     default=3,
@@ -205,16 +257,18 @@ def get_groups(
     ),
 )
 def main(
-    url_json: Path,
+    url_json: tuple[Path, ...],
     rootdir: Path,
     overwrite: bool,
     match_key: str,
     no_video: bool,
+    wrist_video: bool,
     no_body: bool,
     no_narration: bool,
     no_semidense: bool,
     no_gaze: bool,
     prune: bool,
+    dry_run: bool,
     max_retries: int,
     stall_timeout: int,
 ) -> None:
@@ -226,13 +280,15 @@ def main(
         level="INFO",
     )
 
-    dl = DownloadManager(url_json, out_rootdir=rootdir)
+    dl = DownloadManager(list(url_json), out_rootdir=rootdir, dry_run=dry_run)
     # Everything is on by default; each --no-* flag turns one group off.
+    # --wrist-video is the exception: opt-in, since it is ~11 TiB.
     groups = get_groups(
         video=not no_video,
         body=not no_body,
         narration=not no_narration,
         semidense=not no_semidense,
+        wrist_video=wrist_video,
     )
 
     exclude_patterns = list(_EXCLUDE_PATTERNS)
@@ -241,6 +297,27 @@ def main(
         # --prune the already-on-disk motion.vrs is deleted; on a fresh unzip it
         # is stripped. --no-video skips this so motion.vrs is kept.
         exclude_patterns += _VIDEO_EXCLUDE_PATTERNS
+    if wrist_video:
+        # Guard before the swap: with --wrist-video the wrist motion.vrs is
+        # pruned/stripped in favour of data.vrs. If the NymeriaPlus json was not
+        # passed there is no data.vrs link to replace it with, so we would wipe
+        # the wrist recordings. Fail loudly instead.
+        wrist_groups = (
+            DataGroups.recording_lwrist_data_data_vrs,
+            DataGroups.recording_rwrist_data_data_vrs,
+        )
+        if not any(
+            g.name in dgs for dgs in dl.sequences.values() for g in wrist_groups
+        ):
+            logger.error(
+                "--wrist-video requested but no sequence has a "
+                "recording_[lr]wrist_data_data_vrs download link. Pass the "
+                "NymeriaPlus url json too, e.g. "
+                "-i nymeria_all_urls.json -i nymeria_plus_download_urls.json"
+            )
+            sys.exit(1)
+        # Same swap for the wrists, only once their data.vrs is being fetched.
+        exclude_patterns += _WRIST_VIDEO_EXCLUDE_PATTERNS
     if no_gaze:
         # Strip eye_gaze on unzip and drop it from the prune expected-set.
         exclude_patterns += _GAZE_EXCLUDE_PATTERNS
@@ -253,6 +330,7 @@ def main(
         prune=prune,
         stall_timeout=stall_timeout,
         max_retries=max_retries,
+        dry_run=dry_run,
     )
 
 

@@ -75,12 +75,18 @@ INFOS: tuple[InfoDef, ...] = (
     InfoDef(
         "left_wrist",
         DataGroups.recording_lwrist.name,
-        (f"{Subpaths.recording_lwrist}/{VrsFiles.motion}",),
+        (
+            f"{Subpaths.recording_lwrist}/{VrsFiles.motion}",
+            f"{Subpaths.recording_lwrist}/{VrsFiles.data}",
+        ),
     ),
     InfoDef(
         "right_wrist",
         DataGroups.recording_rwrist.name,
-        (f"{Subpaths.recording_rwrist}/{VrsFiles.motion}",),
+        (
+            f"{Subpaths.recording_rwrist}/{VrsFiles.motion}",
+            f"{Subpaths.recording_rwrist}/{VrsFiles.data}",
+        ),
     ),
     InfoDef(
         "observer",
@@ -104,6 +110,16 @@ INFOS: tuple[InfoDef, ...] = (
         "video",
         DataGroups.recording_head_data_data_vrs.name,
         (f"{Subpaths.recording_head}/{VrsFiles.data}",),
+    ),
+    InfoDef(
+        "video_lwrist",
+        DataGroups.recording_lwrist_data_data_vrs.name,
+        (f"{Subpaths.recording_lwrist}/{VrsFiles.data}",),
+    ),
+    InfoDef(
+        "video_rwrist",
+        DataGroups.recording_rwrist_data_data_vrs.name,
+        (f"{Subpaths.recording_rwrist}/{VrsFiles.data}",),
     ),
     InfoDef(
         "semidense",

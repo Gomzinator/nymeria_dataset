@@ -55,6 +55,15 @@ Files might be missing if not downloaded.
 
 NYMERIA_VERSION: str = "v0.0"
 
+# Filename prefixes accepted in the url json(s). The base release (v0.0) and the
+# NymeriaPlus release (v1.0) name their files differently; the plus release is
+# the only source of the wrist data.vrs (SLAM-camera) recordings, which is why
+# both prefixes must be recognised when parsing download links.
+FILENAME_PREFIXES: tuple[str, ...] = (
+    f"Nymeria_{NYMERIA_VERSION}_",
+    "NymeriaPlus_v1.0_",
+)
+
 
 @dataclass(frozen=True)
 class MetaFiles:
@@ -128,7 +137,10 @@ class DataGroups(Enum):
     recording_head = Subpaths.recording_head
     recording_head_data_data_vrs = f"{Subpaths.recording_head}/{VrsFiles.data}"
     recording_lwrist = Subpaths.recording_lwrist
+    # Wrist data.vrs (SLAM camera + IMU) — NymeriaPlus release only.
+    recording_lwrist_data_data_vrs = f"{Subpaths.recording_lwrist}/{VrsFiles.data}"
     recording_rwrist = Subpaths.recording_rwrist
+    recording_rwrist_data_data_vrs = f"{Subpaths.recording_rwrist}/{VrsFiles.data}"
     recording_observer = Subpaths.recording_observer
     recording_observer_data_data_vrs = f"{Subpaths.recording_observer}/{VrsFiles.data}"
 
@@ -160,13 +172,18 @@ def get_group_definitions() -> dict[str, list]:
             if "observations" not in f.name and "points" not in f.name
         ]
 
+    # data.vrs is never part of a recording zip: every recording (head, observer
+    # and — since NymeriaPlus — both wrists) has its own standalone
+    # recording_*_data_data_vrs group that owns it. Keeping it out of the zip
+    # group defs is what lets --prune drop a data.vrs when its group is not
+    # selected. The wrists additionally have no et.vrs / eye_gaze.
     AriaFiles = (
         [f.default for f in fields(VrsFiles) if "data" not in f.name]
         + _slam_no_semidense()
         + [f.default for f in fields(GazeFiles)]
     )
     miniAriaFiles = [
-        f.default for f in fields(VrsFiles) if "et" not in f.name
+        f.default for f in fields(VrsFiles) if f.name not in ("data", "et")
     ] + _slam_no_semidense()
 
     g_defs = {x.name: [x.value] for x in DataGroups}

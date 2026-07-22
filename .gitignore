@@ -3,3 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info
+
+# Download url jsons: per-user signed CDN links that expire ~30 days after
+# they are generated. Never commit them — they are credentials, and stale ones
+# cause 403s (and, before --prune's preflight guard, data loss).
+nymeria_all_urls.json
+nymeria_plus_download_urls.json
+nymeria_download_urls*.json
+
+# Local download / debug output
+output_debug/

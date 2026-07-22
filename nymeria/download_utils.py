@@ -20,9 +20,8 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 from tqdm import tqdm
 
-from .definitions import DataGroups, NYMERIA_VERSION
+from .definitions import DataGroups, FILENAME_PREFIXES, NYMERIA_VERSION
 from .manifest import (
-    MANIFEST_FILENAME,
     blank_was_downloaded,
     build_has,
     scan_was_downloaded,
@@ -48,6 +47,7 @@ class DlStatus(Enum):
     ERR_MEMORY = "error, insufficient disk space"
     ERR_NETWORK = "error, network"
     ERR_STALL = "error, download stalled — max retries exceeded"
+    ERR_EXPIRED = "error, download link expired — refresh the url json"
 
 
 class StallError(Exception):
@@ -65,14 +65,18 @@ class DlLink:
     status: DlStatus = DlStatus.UNKNOWN
 
     def __post_init__(self) -> None:
-        prefix = f"Nymeria_{NYMERIA_VERSION}_"
-        if prefix not in self.filename:
-            self.status = (
-                f"Version mismatch with the release {NYMERIA_VERSION}. "
-                f"Please download the latest url json"
-            )
-            raise ValueError(self.status)
-        self.filename = self.filename.replace(prefix, "")
+        # Accept any known release prefix (base Nymeria + NymeriaPlus, which is
+        # where the wrist data.vrs links come from) and strip it, so seq_name
+        # parsing below sees a bare <date>_<s?>_<first>_<last>_<act>_<uid>_...
+        for prefix in FILENAME_PREFIXES:
+            if prefix in self.filename:
+                self.filename = self.filename.replace(prefix, "")
+                return
+        self.status = (
+            f"Version mismatch with the release {NYMERIA_VERSION}. "
+            f"Please download the latest url json"
+        )
+        raise ValueError(self.status)
 
     @property
     def seq_name(self) -> str:
@@ -106,8 +110,16 @@ class DlLink:
         """
         flag = outdir / self.logdir / self.data_group.name
         if flag.is_file() and ignore_existing:
-            self.status = DlStatus.IGNORED
-            return
+            missing = self._missing_payload(outdir, exclude_patterns)
+            if not missing:
+                self.status = DlStatus.IGNORED
+                return
+            # The flag is stale: this group was downloaded under a different
+            # selection (e.g. --wrist-video stripped motion.vrs, and we are now
+            # running without it). Re-fetch so the swap is reversible.
+            logger.info(
+                f"{self.data_group.name}: re-downloading, missing {missing}"
+            )
 
         self.__check_outdir(outdir)
 
@@ -137,6 +149,35 @@ class DlLink:
         # flag = outdir/logs/<group_name>; the logs/ dir may not exist yet.
         flag.parent.mkdir(exist_ok=True)
         flag.touch()
+
+    def _missing_payload(
+        self, outdir: Path, exclude_patterns: list[str] | None
+    ) -> list[str]:
+        """
+        VRS files this group should have delivered but that are absent on disk.
+
+        Used to detect a stale "done" flag when the selection changed between
+        runs — the motion.vrs <-> data.vrs swap is the case that matters, since
+        turning --wrist-video (or --video) back off must bring motion.vrs back
+        rather than leave recording_*/data empty forever.
+
+        Deliberately limited to .vrs files: they are the payload every recording
+        zip always carries, whereas some MPS csvs are legitimately absent for
+        some sequences (e.g. personalized_eye_gaze.csv), which would otherwise
+        trigger a pointless re-download on every single run.
+        """
+        from .definitions import get_group_definitions
+
+        rels = get_group_definitions().get(
+            self.data_group.name, [self.data_group.value]
+        )
+        return [
+            rel
+            for rel in rels
+            if rel.endswith(".vrs")
+            and not (exclude_patterns and any(p in rel for p in exclude_patterns))
+            and not (outdir / rel).is_file()
+        ]
 
     def _attempt(
         self,
@@ -175,6 +216,25 @@ class DlLink:
                 raise RuntimeError(f"Connection error: {e}") from e
 
             with r_ctx as r:
+                # Check the HTTP status BEFORE streaming. These are signed CDN
+                # urls with a short lifetime: once the json ages out the server
+                # answers 403 "URL signature expired" with a 21-byte text body.
+                # Hashing that body and reporting "sha1sum mismatch" (what this
+                # code used to do, since raise_for_status ran last) sends you
+                # hunting for corruption instead of refreshing the json.
+                if r.status_code == 403:
+                    self.status = DlStatus.ERR_EXPIRED
+                    raise RuntimeError(
+                        f"{r.status_code} {r.reason} for {self.filename} — the "
+                        f"download links in the url json have expired. "
+                        f"Re-download the url json from the Nymeria website."
+                    )
+                try:
+                    r.raise_for_status()
+                except Exception as e:
+                    self.status = DlStatus.ERR_NETWORK
+                    raise RuntimeError(e) from e
+
                 free_outdir = shutil.disk_usage(outdir).free
                 free_tmpdir = shutil.disk_usage(tmpdir).free
                 if (
@@ -239,12 +299,6 @@ class DlLink:
                             f"sha1sum mismatch, computed {computed}, expected {self.sha1sum}"
                         )
 
-                try:
-                    r.raise_for_status()
-                except Exception as e:
-                    self.status = DlStatus.ERR_NETWORK
-                    raise RuntimeError(e) from e
-
             # move from tmp → dst
             if is_zipfile(tmp_filename):
                 logger.info("unzip")
@@ -274,20 +328,49 @@ class DlLink:
 
 
 class DownloadManager:
-    def __init__(self, url_json: Path, out_rootdir: Path) -> None:
-        self.url_json = url_json
-        assert self.url_json.is_file(), f"{self.url_json} not found"
+    def __init__(
+        self,
+        url_json: Path | list[Path],
+        out_rootdir: Path,
+        dry_run: bool = False,
+    ) -> None:
+        # One or more url jsons, merged per sequence per data group. The base
+        # release and the NymeriaPlus release ship separate jsons that describe
+        # disjoint data groups for the same 1100 sequences (the wrist data.vrs
+        # links only exist in the plus json), so both are needed to download the
+        # full set. On a (sequence, group) collision the later json wins.
+        self.url_jsons = [url_json] if isinstance(url_json, Path) else list(url_json)
+        assert self.url_jsons, "No url json provided"
+        for p in self.url_jsons:
+            assert p.is_file(), f"{p} not found"
+        self.url_json = self.url_jsons[0]
 
         self.out_rootdir = out_rootdir
         self.out_rootdir.mkdir(exist_ok=True)
 
-        with open(self.url_json, "r") as f:
-            data = json.load(f)
-            self._sequences = data.get("sequences", {})
-            assert len(self._sequences), (
-                "No sequence found. Please check the json file is correct."
+        self._sequences: dict[str, dict] = {}
+        # One representative url per json, used by _preflight() to detect an
+        # expired json before anything destructive happens. Signed urls in a
+        # given json share an expiry window, so one sample is a good proxy.
+        self._preflight_samples: dict[Path, str] = {}
+        for p in self.url_jsons:
+            with open(p, "r") as f:
+                sequences = json.load(f).get("sequences", {})
+            assert len(sequences), f"No sequence found in {p}. Please check the json file is correct."
+            for seq, dgs in sequences.items():
+                self._sequences.setdefault(seq, {}).update(dgs)
+                for entry in dgs.values():
+                    if p not in self._preflight_samples and "download_url" in entry:
+                        self._preflight_samples[p] = entry["download_url"]
+        if len(self.url_jsons) > 1:
+            logger.info(
+                f"merged {len(self.url_jsons)} url jsons → {len(self._sequences)} sequences"
             )
-        self.__get_data_summary()
+
+        # data_summary.json is a record of the input json(s) written into the
+        # output dir. A --dry-run must leave the output dir untouched, so skip it.
+        if not dry_run:
+            self.__get_data_summary()
         self._logs = {}
 
     @property
@@ -322,8 +405,10 @@ class DownloadManager:
         match_key: str,
         selected_groups: list["DataGroups"],
         ignore_existing: bool = True,
+        exclude_patterns: list[str] | None = None,
         prune_targets: list[Path] | None = None,
         prune_freed_gb: float = 0.0,
+        dry_run: bool = False,
     ) -> set["DataGroups"]:
         selected_groups += [DataGroups.LICENSE, DataGroups.metadata_json]
         selected_groups = set(selected_groups)
@@ -333,6 +418,11 @@ class DownloadManager:
         num_skipped = 0      # files already on disk (flag present)
         total_gb = 0         # full project size (all selected files)
         pending_gb = 0       # size of files still to download
+        # Per-action plan, only used to print the --dry-run breakdown. Each entry
+        # is (seq, group.value[, missing_payload]) so the dry-run can spell out
+        # the motion.vrs <-> data.vrs swaps rather than just a count.
+        plan_new: list[tuple[str, str]] = []       # fresh downloads (no flag yet)
+        plan_redl: list[tuple[str, str, list]] = []  # stale flag → re-download
         self._logs = {}
 
         for seq, dgs in self.sequences.items():
@@ -351,11 +441,28 @@ class DownloadManager:
                     file_gb = dl.file_size_bytes / (2**30)
                     total_gb += file_gb
                     flag = outdir / dl.logdir / dg.name
-                    if flag.is_file() and ignore_existing:
+                    # Mirror DlLink.download exactly: a "done" flag only counts
+                    # as done if the group's vrs payload is actually on disk. A
+                    # stale flag (selection changed between runs — e.g. reverting
+                    # --wrist-video, where data.vrs must go back to motion.vrs)
+                    # means the file WILL be re-downloaded, so it has to be
+                    # counted here too. Otherwise the confirmation prompt and,
+                    # worse, the free-space check understate the real transfer.
+                    flag_ok = flag.is_file() and ignore_existing
+                    missing = (
+                        dl._missing_payload(outdir, exclude_patterns)
+                        if flag_ok
+                        else []
+                    )
+                    if flag_ok and not missing:
                         num_skipped += 1
                     else:
                         pending_gb += file_gb
                         num_files += 1
+                        if flag_ok:  # stale flag → re-download the stripped payload
+                            plan_redl.append((seq, dg.value, missing))
+                        else:
+                            plan_new.append((seq, dg.value))
 
         self._num_download_files = num_files + num_skipped  # total for outer bar
 
@@ -380,25 +487,79 @@ class DownloadManager:
             f"< download size ({pending_gb:.2f} GB) — may run out of disk!\n"
         )
 
-        confirm = (
-            input(
-                f"Download summary\n"
-                f"  Output rootdir: {self.out_rootdir}\n"
-                f"  Number of sequences: {num_seqs}\n"
-                f"  Total size (GB): {total_gb:.2f}\n"
-                f"  Files to download: {num_files}{skip_note}\n"
-                f"  Total size to download (GB): {pending_gb:.2f}\n"
-                f"{prune_lines}"
-                f"  Available free disk space (GB): {free_disk_gb:.2f}\n"
-                f"{space_warning}"
-                f"  Selected data groups:\n{msg}\n"
-                f"Proceed: [y/n] "
-            ).lower()
-            == "y"
+        summary = (
+            f"Download summary\n"
+            f"  Output rootdir: {self.out_rootdir}\n"
+            f"  Number of sequences: {num_seqs}\n"
+            f"  Total size (GB): {total_gb:.2f}\n"
+            f"  Files to download: {num_files}{skip_note}\n"
+            f"  Total size to download (GB): {pending_gb:.2f}\n"
+            f"{prune_lines}"
+            f"  Available free disk space (GB): {free_disk_gb:.2f}\n"
+            f"{space_warning}"
+            f"  Selected data groups:\n{msg}\n"
         )
+
+        if dry_run:
+            # Print the same summary plus a per-file action breakdown, then let
+            # download() return without touching disk or the network. This is the
+            # supported way to preview the motion.vrs <-> data.vrs swaps: prune
+            # (delete) + re-download (restore stripped payload) + new download.
+            print(
+                "DRY RUN — nothing will be downloaded, pruned, or modified.\n\n"
+                + summary
+                + self._format_plan(prune_targets or [], plan_redl, plan_new)
+            )
+            return selected_groups
+
+        confirm = input(summary + "Proceed: [y/n] ").lower() == "y"
         if not confirm:
             exit(1)
         return selected_groups
+
+    # Cap on how many individual paths each --dry-run section prints, so a
+    # full-dataset preview does not scroll off thousands of lines. The counts in
+    # the summary above are always exact; only the verbose listing is truncated.
+    _DRY_RUN_MAX_LINES = 60
+
+    def _format_plan(
+        self,
+        prune_targets: list[Path],
+        plan_redl: list[tuple[str, str, list]],
+        plan_new: list[tuple[str, str]],
+    ) -> str:
+        """Render the --dry-run action breakdown (prune / re-download / new)."""
+
+        def section(title: str, lines: list[str]) -> str:
+            shown = lines[: self._DRY_RUN_MAX_LINES]
+            body = "\n".join(f"    {ln}" for ln in shown) if shown else "    (none)"
+            more = len(lines) - len(shown)
+            if more > 0:
+                body += f"\n    ... and {more} more"
+            return f"  {title}\n{body}\n"
+
+        prune_lines = sorted(
+            p.relative_to(self.out_rootdir).as_posix() for p in prune_targets
+        )
+        # Re-download == the swap's restore leg: flag present but the vrs payload
+        # was stripped by a previous selection (e.g. reverting --wrist-video or
+        # --video). Show which file is being brought back.
+        redl_lines = [
+            f"{seq}/{grp}"
+            + (f"   (restores {', '.join(missing)})" if missing else "")
+            for seq, grp, missing in sorted(plan_redl)
+        ]
+        new_lines = [f"{seq}/{grp}" for seq, grp in sorted(plan_new)]
+
+        return (
+            "\nPlanned actions\n"
+            + section(f"Prune — delete {len(prune_lines)} file(s):", prune_lines)
+            + section(
+                f"Re-download — restore stripped payload, {len(redl_lines)} group(s):",
+                redl_lines,
+            )
+            + section(f"Download new — {len(new_lines)} group(s):", new_lines)
+        )
 
     def _compute_prune_targets(
         self,
@@ -410,8 +571,13 @@ class DownloadManager:
         Dry-run: compute which files on disk don't belong to the selected groups.
 
         L_expected  = file paths that should exist for the given groups
-        L_exists    = files currently on disk under out_rootdir
+        L_exists    = files currently on disk under out_rootdir, restricted to
+                      the sequences selected by match_key
         L_delete    = L_exists - L_expected
+
+        Scoping to match_key matters: prune must never touch a sequence this run
+        is not managing. Without it, `-k <one_seq> --prune` would treat every
+        other sequence on disk as unexpected and delete it wholesale.
 
         Returns (files_to_delete, freed_gb). Nothing is deleted.
         """
@@ -419,16 +585,14 @@ class DownloadManager:
 
         group_defs = get_group_definitions()
 
-        # Build L_expected (posix paths relative to out_rootdir). The top-level
-        # bookkeeping files we emit must never be pruned.
-        expected: set[str] = {
-            "download_summary.json",
-            "data_summary.json",
-            MANIFEST_FILENAME,
-        }
+        # Build L_expected (posix paths relative to out_rootdir) and, alongside,
+        # the set of sequence dirs prune is allowed to descend into.
+        expected: set[str] = set()
+        pruneable_seqs: set[str] = set()
         for seq_name in self.sequences:
             if match_key not in seq_name:
                 continue
+            pruneable_seqs.add(seq_name)
             for dg in selected_groups:
                 for rel in group_defs.get(dg.name, [dg.value]):
                     if exclude_patterns and any(pat in rel for pat in exclude_patterns):
@@ -437,14 +601,48 @@ class DownloadManager:
                 # keep the "done" flag for this group
                 expected.add(f"{seq_name}/logs/{dg.name}")
 
-        # Build L_delete
-        to_delete: list[Path] = [
-            p for p in self.out_rootdir.rglob("*")
-            if p.is_file()
-            and p.relative_to(self.out_rootdir).as_posix() not in expected
-        ]
+        # Build L_delete. Only files inside a matched sequence dir are eligible,
+        # which also keeps the top-level bookkeeping files (download_summary.json,
+        # data_summary.json, manifest.json) and any unrelated content safe.
+        to_delete: list[Path] = []
+        for seq_name in sorted(pruneable_seqs):
+            seq_dir = self.out_rootdir / seq_name
+            if not seq_dir.is_dir():
+                continue
+            to_delete += [
+                p for p in seq_dir.rglob("*")
+                if p.is_file()
+                and p.relative_to(self.out_rootdir).as_posix() not in expected
+            ]
         freed_gb = sum(p.stat().st_size for p in to_delete) / (2**30)
         return to_delete, freed_gb
+
+    def _preflight(self) -> list[Path]:
+        """
+        Probe one url per input json; return the jsons whose links are dead.
+
+        Signed CDN urls expire (403 "URL signature expired") a few weeks after
+        the json is generated. That matters most right before --prune: prune
+        deletes first and downloads second, so pruning against an expired json
+        destroys files that cannot be re-fetched. One 1-byte ranged GET per json
+        is enough to tell.
+        """
+        expired: list[Path] = []
+        for path, url in self._preflight_samples.items():
+            try:
+                r = requests.get(
+                    url,
+                    stream=True,
+                    headers={"Range": "bytes=0-0"},
+                    timeout=DlConfig.CONNECT_TIMEOUT.value,
+                )
+                r.close()
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"preflight for {path.name} could not complete: {e}")
+                continue
+            if r.status_code == 403:
+                expired.append(path)
+        return expired
 
     @staticmethod
     def _execute_prune(to_delete: list[Path], out_rootdir: Path) -> None:
@@ -501,6 +699,7 @@ class DownloadManager:
         prune: bool = False,
         stall_timeout: int = 30,
         max_retries: int = 3,
+        dry_run: bool = False,
     ) -> None:
         # Compute prune targets upfront so __prepare can show the full picture
         # (freed space, effective free space, space check) in a single confirmation.
@@ -518,9 +717,18 @@ class DownloadManager:
             match_key,
             selected_groups,
             ignore_existing=ignore_existing,
+            exclude_patterns=exclude_patterns,
             prune_targets=prune_targets,
             prune_freed_gb=prune_freed_gb,
+            dry_run=dry_run,
         )
+
+        # --dry-run stops here: the summary + action plan have been printed and
+        # nothing on disk (manifest, prune, downloads) or the network (expiry
+        # preflight) is touched. The real run repeats this preview as its [y/n]
+        # confirmation prompt.
+        if dry_run:
+            return
 
         # Capability manifest (write-only; never read back). Build `has` from the
         # input json up front so it survives an interrupted download; the
@@ -533,8 +741,22 @@ class DownloadManager:
             self.out_rootdir, manifest_has, blank_was_downloaded(seq_names)
         )
 
-        # Prune first to free space before the download starts
+        # Prune first to free space before the download starts. Because that
+        # ordering is destructive-before-restorative, refuse to prune at all if
+        # any input json has expired: otherwise we delete a motion.vrs (or a
+        # data.vrs) and then fail to fetch its replacement, leaving the
+        # recording empty with no way back.
         if prune_targets:
+            expired = self._preflight()
+            if expired:
+                logger.error(
+                    "Refusing to prune: the download links have expired in "
+                    + ", ".join(p.name for p in expired)
+                    + ". Pruning now would delete files that cannot be "
+                    "re-downloaded. Re-download the url json(s) from the "
+                    "Nymeria website, then re-run."
+                )
+                raise SystemExit(1)
             self._execute_prune(prune_targets, self.out_rootdir)
             logger.info(f"Pruned {len(prune_targets)} files ({prune_freed_gb:.2f} GB freed).")
 
