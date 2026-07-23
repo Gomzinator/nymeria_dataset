@@ -13,3 +13,5 @@ nymeria_download_urls*.json
 
 # Local download / debug output
 output_debug/
+imu_recovery/
+samples/
