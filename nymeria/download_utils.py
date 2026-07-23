@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from stat import S_ISDIR
 from zipfile import is_zipfile, ZipFile
 
 import requests
@@ -604,18 +605,95 @@ class DownloadManager:
         # Build L_delete. Only files inside a matched sequence dir are eligible,
         # which also keeps the top-level bookkeeping files (download_summary.json,
         # data_summary.json, manifest.json) and any unrelated content safe.
+        #
+        # One stat per entry (not is_file() + a separate stat() pass): over a
+        # slow SMB share a two-pass scan of 1100 sequences lets the session go
+        # stale between passes, and each stat is a network round trip. Stat is
+        # resilient (see _stat_resilient) so a transient blip does not abort the
+        # whole scan — which is what crashed a real 1100-sequence NAS run.
         to_delete: list[Path] = []
+        freed_bytes = 0
+        unreadable: list[Path] = []
         for seq_name in sorted(pruneable_seqs):
             seq_dir = self.out_rootdir / seq_name
-            if not seq_dir.is_dir():
+            st = self._stat_resilient(seq_dir, unreadable)
+            if st is None or not S_ISDIR(st.st_mode):
                 continue
-            to_delete += [
-                p for p in seq_dir.rglob("*")
-                if p.is_file()
-                and p.relative_to(self.out_rootdir).as_posix() not in expected
-            ]
-        freed_gb = sum(p.stat().st_size for p in to_delete) / (2**30)
+            try:
+                # Materialise this one sequence's walk so a mid-walk network
+                # error is caught per-sequence instead of killing the whole scan.
+                entries = list(seq_dir.rglob("*"))
+            except OSError as e:
+                logger.warning(f"prune scan: could not list {seq_name} ({e}); skipped")
+                unreadable.append(seq_dir)
+                self._abort_if_fs_unstable(unreadable)
+                continue
+            for p in entries:
+                if p.relative_to(self.out_rootdir).as_posix() in expected:
+                    continue
+                st = self._stat_resilient(p, unreadable)
+                if st is None:
+                    self._abort_if_fs_unstable(unreadable)
+                    continue
+                if S_ISDIR(st.st_mode):
+                    continue
+                to_delete.append(p)
+                freed_bytes += st.st_size
+
+        if unreadable:
+            logger.warning(
+                f"prune scan: {len(unreadable)} path(s) stayed unreadable after "
+                "retries (network/SMB blips); excluded from the freed-space "
+                "estimate. Re-run if the reported prune size looks low."
+            )
+        freed_gb = freed_bytes / (2**30)
         return to_delete, freed_gb
+
+    # Above this many unreadable paths, assume the output filesystem is down
+    # (e.g. an SMB share dropped) rather than a scattered blip, and abort the
+    # scan loudly instead of grinding through thousands of retrying stats. Safe:
+    # this is the dry-run costing phase — nothing has been deleted yet.
+    _MAX_PRUNE_SCAN_ERRORS = 25
+
+    def _abort_if_fs_unstable(self, unreadable: list[Path]) -> None:
+        if len(unreadable) > self._MAX_PRUNE_SCAN_ERRORS:
+            raise RuntimeError(
+                f"prune scan aborted: {len(unreadable)} paths under "
+                f"{self.out_rootdir} were unreadable — the output filesystem "
+                "looks unavailable (network share down?). Nothing was deleted; "
+                "re-run once it is stable."
+            )
+
+    @staticmethod
+    def _stat_resilient(p: Path, unreadable: list[Path]):
+        """
+        p.stat(), retrying transient network errors, for scanning over SMB.
+
+        Windows surfaces a dropped/again-unreachable share as WinError 53/64/...
+        which Python raises as FileNotFoundError/OSError — the same type as a
+        genuinely absent file. Only ERROR_FILE_NOT_FOUND (2) / ERROR_PATH_NOT_
+        FOUND (3), and a POSIX ENOENT, mean "really gone" (return None silently);
+        anything else is treated as transient and retried. After the last retry
+        the path is recorded in `unreadable` and None is returned, so the caller
+        can keep scanning instead of crashing.
+        """
+        delays = (0.5, 1, 2, 4)
+        for i, delay in enumerate(delays):
+            try:
+                return p.stat()
+            except OSError as e:
+                winerr = getattr(e, "winerror", None)
+                really_missing = winerr in (2, 3) or (
+                    winerr is None and isinstance(e, FileNotFoundError)
+                )
+                if really_missing:
+                    return None
+                if i == len(delays) - 1:
+                    logger.warning(f"stat: giving up on {p} after retries ({e})")
+                    unreadable.append(p)
+                    return None
+                time.sleep(delay)
+        return None
 
     def _preflight(self) -> list[Path]:
         """
@@ -646,12 +724,33 @@ class DownloadManager:
 
     @staticmethod
     def _execute_prune(to_delete: list[Path], out_rootdir: Path) -> None:
-        """Delete the given files and remove empty directories."""
+        """Delete the given files and remove directories they leave empty."""
+        # Tolerate per-file errors: a transient SMB blip must not abort a real
+        # prune half-way (that is how a recording gets partially wiped). An
+        # already-absent file is a no-op success.
+        deleted_parents: set[Path] = set()
         for p in to_delete:
-            p.unlink()
-        for dirpath in sorted(out_rootdir.rglob("*"), reverse=True):
-            if dirpath.is_dir() and not any(dirpath.iterdir()):
-                dirpath.rmdir()
+            try:
+                p.unlink()
+                deleted_parents.add(p.parent)
+            except FileNotFoundError:
+                deleted_parents.add(p.parent)
+            except OSError as e:
+                logger.warning(f"prune: could not delete {p} ({e})")
+
+        # Remove now-empty dirs by walking UP from each deleted file's parent.
+        # The old code rglob'd the entire out_rootdir, which over SMB re-walks
+        # all 1100 sequences (minutes) and, on a scoped -k run, needlessly
+        # touches unrelated sequences. rmdir only succeeds on an empty dir, so
+        # this stops at the first non-empty ancestor.
+        for parent in sorted(deleted_parents, key=lambda d: len(d.parts), reverse=True):
+            cur = parent
+            while cur != out_rootdir and cur.is_dir():
+                try:
+                    cur.rmdir()
+                except OSError:
+                    break  # not empty (or unreachable) — leave it and stop
+                cur = cur.parent
 
     def prune(
         self,
